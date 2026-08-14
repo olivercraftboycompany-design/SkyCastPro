@@ -109,6 +109,29 @@ function moonPhase(date) {
   return { name: names[idx], illumination, phase };
 }
 
+function sunArcProgress(now, sunriseIso, sunsetIso) {
+  // Returns { frac, isDay, phaseLabel } where frac is 0..1 across the visible day/night arc
+  const sunrise = new Date(sunriseIso).getTime();
+  const sunset = new Date(sunsetIso).getTime();
+  const t = now.getTime();
+  if (t >= sunrise && t <= sunset) {
+    const frac = (t - sunrise) / (sunset - sunrise);
+    let phaseLabel = 'Daytime';
+    if (frac < 0.08) phaseLabel = 'Sunrise';
+    else if (frac > 0.92) phaseLabel = 'Sunset approaching';
+    else if (frac < 0.35) phaseLabel = 'Morning';
+    else if (frac < 0.65) phaseLabel = 'Midday';
+    else phaseLabel = 'Afternoon';
+    return { frac, isDay:true, phaseLabel };
+  }
+  // Nighttime: map remaining night hours across a 0..1 arc for a moon path
+  let nightStart, nightEnd;
+  if (t > sunset) { nightStart = sunset; nightEnd = sunrise + 86400000; }
+  else { nightStart = sunset - 86400000; nightEnd = sunrise; }
+  const frac = (t - nightStart) / (nightEnd - nightStart);
+  return { frac: Math.min(1, Math.max(0, frac)), isDay:false, phaseLabel: 'Nighttime' };
+}
+
 function fmtTime(iso, opts) {
   try { return new Date(iso).toLocaleTimeString([], opts || {hour:'2-digit', minute:'2-digit'}); }
   catch(e){ return "—"; }
@@ -133,15 +156,21 @@ const state = {
   isLocating: false,
   view: 'dashboard', // 'dashboard' | 'warnings'
   expandedAlert: null,
+  expandedHour: null,
+  expandedDay: null,
   searchQuery: '',
   searchResults: [],
   showDropdown: false,
   searchTimer: null,
   mapKeyRendered: null,
+  nationalAlerts: [],
+  nationalAlertsLoading: false,
+  nationalAlertsError: false,
 };
 
 let leafletMap = null;
-let leafletMarker = null;
+let precipLayerGroup = null;
+let alertLayerGroup = null;
 
 /* ============================== DATA FETCHING ============================== */
 
@@ -241,6 +270,93 @@ async function fetchAllData() {
   render();
 }
 
+/* ============================== NATIONAL STORM TRACKER ============================== */
+
+const STORM_EVENT_STYLE = {
+  'Tornado Warning':          { color:'#ef4444', priority:5 },
+  'Tornado Watch':            { color:'#fb923c', priority:4 },
+  'Severe Thunderstorm Warning': { color:'#f59e0b', priority:3 },
+  'Severe Thunderstorm Watch':   { color:'#facc15', priority:2 },
+  'Flash Flood Warning':      { color:'#22d3ee', priority:2 },
+  'Hurricane Warning':        { color:'#d946ef', priority:5 },
+  'Hurricane Watch':          { color:'#c084fc', priority:4 },
+};
+function stormStyle(event) {
+  return STORM_EVENT_STYLE[event] || { color:'#94a3b8', priority:1 };
+}
+
+async function fetchNationalStormAlerts() {
+  state.nationalAlertsLoading = true;
+  state.nationalAlertsError = false;
+  render();
+  try {
+    const eventTypes = ['Tornado Warning','Tornado Watch','Severe Thunderstorm Warning','Severe Thunderstorm Watch','Flash Flood Warning','Hurricane Warning','Hurricane Watch'];
+    const res = await fetch(`https://api.weather.gov/alerts/active?status=actual&message_type=alert,update`);
+    if (!res.ok) throw new Error('bad response');
+    const json = await res.json();
+    const features = json.features || [];
+    const filtered = features.filter(f => eventTypes.includes(f.properties.event));
+    state.nationalAlerts = filtered.map(f => ({
+      ...f.properties,
+      id: f.id || f.properties.id,
+      geometry: f.geometry,
+    })).sort((a,b) => stormStyle(b.event).priority - stormStyle(a.event).priority);
+  } catch (e) {
+    console.error('National storm alert fetch failed', e);
+    state.nationalAlerts = [];
+    state.nationalAlertsError = true;
+  }
+  state.nationalAlertsLoading = false;
+  render();
+}
+
+/* ============================== SMART ALERTS ENGINE ============================== */
+
+function generateSmartAlerts() {
+  if (!state.weather) return [];
+  const { current, daily, hourly } = state.weather;
+  const unit = state.unit;
+  const tips = [];
+  const hrIdx = Math.max(0, hourly.time.findIndex(t => new Date(t) > new Date()));
+
+  const uv = daily.uv_index_max ? daily.uv_index_max[0] : 0;
+  if (uv >= 8) tips.push({ icon:'sun', level:'warn', text:`Extreme UV today (index ${Math.round(uv)}). Wear SPF 30+, sunglasses, and limit midday sun exposure.` });
+  else if (uv >= 6) tips.push({ icon:'sun', level:'info', text:`High UV today (index ${Math.round(uv)}). Sunscreen recommended if you're outside for long.` });
+
+  const feels = current.apparent_temperature;
+  const heatThresh = unit==='F' ? 100 : 38;
+  const coldThresh = unit==='F' ? 15 : -9;
+  if (feels >= heatThresh) tips.push({ icon:'thermometer-sun', level:'warn', text:`Dangerous heat — feels like ${Math.round(feels)}°${unit}. Stay hydrated and limit strenuous outdoor activity.` });
+  if (feels <= coldThresh) tips.push({ icon:'thermometer-snowflake', level:'warn', text:`Dangerous cold — feels like ${Math.round(feels)}°${unit}. Bundle up and limit skin exposure.` });
+
+  const gust = current.wind_gusts_10m || 0;
+  const gustThresh = unit==='F' ? 40 : 64;
+  if (gust >= gustThresh) tips.push({ icon:'wind', level:'warn', text:`Strong wind gusts up to ${Math.round(gust)} ${unit==='F'?'mph':'km/h'} — secure loose outdoor objects.` });
+
+  const freezeLevel = hourly.freezing_level_height ? hourly.freezing_level_height[hrIdx] : null;
+  const precipNext = hourly.precipitation_probability ? hourly.precipitation_probability[hrIdx] : 0;
+  if (current.temperature_2m <= (unit==='F'?34:1) && precipNext >= 40) {
+    tips.push({ icon:'cloud-snow', level:'warn', text:`Near-freezing temps with precipitation likely — watch for icy roads and sidewalks.` });
+  }
+
+  const cape = hourly.cape ? hourly.cape[hrIdx] : 0;
+  if (cape >= 2500) tips.push({ icon:'zap', level:'warn', text:`High CAPE (${Math.round(cape)} J/kg) signals strong thunderstorm potential this afternoon.` });
+
+  const rainSum = daily.precipitation_sum ? daily.precipitation_sum[0] : 0;
+  if (rainSum >= (unit==='F'?1.5:38/25.4)) tips.push({ icon:'cloud-rain-wind', level:'info', text:`Heavy rain expected today (${rainSum.toFixed(2)} in) — allow extra travel time.` });
+
+  const aqi = state.aqi && state.aqi.current ? state.aqi.current.us_aqi : null;
+  if (aqi != null && aqi > 100) tips.push({ icon:'activity', level: aqi>150?'warn':'info', text:`Air quality is ${aqiSeverity(aqi).label.toLowerCase()} (AQI ${aqi}). Sensitive groups should limit outdoor exertion.` });
+
+  const vis = current.visibility;
+  const visThreshM = unit==='F' ? 1609.34 : 1000;
+  if (vis != null && vis < visThreshM) tips.push({ icon:'cloud-fog', level:'info', text:`Low visibility conditions — drive with headlights on and extra following distance.` });
+
+  if (tips.length === 0) tips.push({ icon:'check-circle', level:'good', text:'Conditions look normal — no elevated weather risks detected right now.' });
+
+  return tips;
+}
+
 async function handleGeolocation() {
   if (!navigator.geolocation) return;
   state.isLocating = true; render();
@@ -299,6 +415,8 @@ function toggleUnit() {
 
 function setView(v) { state.view = v; state.expandedAlert = null; render(); }
 function toggleAlert(idx) { state.expandedAlert = state.expandedAlert === idx ? null : idx; render(); }
+function toggleHour(idx) { state.expandedHour = state.expandedHour === idx ? null : idx; state.expandedDay = null; render(); }
+function toggleDay(idx) { state.expandedDay = state.expandedDay === idx ? null : idx; state.expandedHour = null; render(); }
 
 /* ============================== RENDER: NAV ============================== */
 
@@ -478,6 +596,99 @@ function miniDial(value, min, max, color, sizePx) {
   </svg>`;
 }
 
+function renderHourDetail(idx) {
+  const { hourly } = state.weather;
+  const unit = state.unit;
+  if (!hourly || !hourly.time[idx]) return '';
+  const t = hourly.time[idx];
+  const hr = new Date(t).getHours();
+  const isDay = hr>=6 && hr<=19;
+  const [ic, icColor] = ICON_MAP(hourly.weather_code[idx], isDay?1:0);
+  const wUnit = unit==='F'?'mph':'km/h';
+  const items = [
+    { icon:'droplets', label:'Precip Chance', value:`${hourly.precipitation_probability?.[idx] ?? 0}%` },
+    { icon:'cloud-rain', label:'Rain', value:`${(hourly.rain?.[idx]||0).toFixed(2)} in` },
+    { icon:'cloud-snow', label:'Snowfall', value:`${(hourly.snowfall?.[idx]||0).toFixed(2)} in` },
+    { icon:'eye', label:'Visibility', value: unit==='F' ? `${Math.round((hourly.visibility?.[idx]||0)/1609.34)} mi` : `${Math.round((hourly.visibility?.[idx]||0)/1000)} km` },
+    { icon:'wind', label:'80m Wind', value:`${Math.round(hourly.wind_speed_80m?.[idx]||0)} ${wUnit}` },
+    { icon:'thermometer', label:'80m Temp', value:`${Math.round(hourly.temperature_80m?.[idx]||0)}°${unit}` },
+    { icon:'zap', label:'CAPE', value:`${Math.round(hourly.cape?.[idx]||0)} J/kg` },
+    { icon:'shield-alert', label:'Lifted Index', value:`${(hourly.lifted_index?.[idx]||0).toFixed(1)}` },
+    { icon:'cloud-snow', label:'Freezing Level', value:`${Math.round((hourly.freezing_level_height?.[idx]||0)*3.28084)} ft` },
+    { icon:'arrow-up-right', label:'Boundary Layer', value:`${Math.round(hourly.boundary_layer_height?.[idx]||0)} m` },
+    { icon:'sun', label:'Solar Radiation', value:`${Math.round(hourly.shortwave_radiation?.[idx]||0)} W/m²` },
+    { icon:'zap', label:'Vapor Deficit', value:`${(hourly.vapor_pressure_deficit?.[idx]||0).toFixed(2)} kPa` },
+    { icon:'waves', label:'Evapotranspiration', value:`${(hourly.evapotranspiration?.[idx]||0).toFixed(2)} mm` },
+  ];
+  return `
+  <div class="glass rounded-2xl p-5 mt-4 fade-in">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <i data-lucide="${ic}" class="${icColor}" style="width:28px;height:28px"></i>
+        <div>
+          <p class="font-semibold text-lg">${new Date(t).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})} <span class="text-slate-400 font-normal text-sm">· ${escapeHtml(WEATHER_DESC[hourly.weather_code[idx]] || '—')}</span></p>
+          <p class="text-sm text-slate-400">${Math.round(hourly.temperature_2m[idx])}°${unit}</p>
+        </div>
+      </div>
+      <button onclick="toggleHour(${idx})" class="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-white/10 transition-colors">
+        <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+      ${items.map(it => `
+        <div class="bg-white/5 border border-white/5 rounded-xl p-3">
+          <div class="flex items-center gap-1.5 text-slate-400 mb-1"><i data-lucide="${it.icon}" style="width:12px;height:12px"></i><span class="text-xs font-medium">${it.label}</span></div>
+          <p class="text-sm font-semibold text-white">${it.value}</p>
+        </div>`).join('')}
+    </div>
+  </div>`;
+}
+
+function renderDayDetail(idx) {
+  const { daily } = state.weather;
+  const unit = state.unit;
+  if (!daily || !daily.time[idx]) return '';
+  const t = daily.time[idx];
+  const [ic, icColor] = ICON_MAP(daily.weather_code[idx], 1);
+  const wUnit = unit==='F'?'mph':'km/h';
+  const uv = daily.uv_index_max?.[idx]||0;
+  const items = [
+    { icon:'droplets', label:'Precip Chance', value:`${daily.precipitation_probability_max?.[idx] ?? 0}%` },
+    { icon:'droplet', label:'Precip Total', value:`${(daily.precipitation_sum?.[idx]||0).toFixed(2)} in` },
+    { icon:'cloud-rain', label:'Rain', value:`${(daily.rain_sum?.[idx]||0).toFixed(2)} in` },
+    { icon:'cloud-snow', label:'Snowfall', value:`${(daily.snowfall_sum?.[idx]||0).toFixed(2)} in` },
+    { icon:'clock', label:'Precip Hours', value:`${daily.precipitation_hours?.[idx]||0} hrs` },
+    { icon:'sun', label:'UV Index', value:`${Math.round(uv)} · ${uvSeverity(uv)}` },
+    { icon:'sunrise', label:'Sunrise', value: fmtTime(daily.sunrise?.[idx]) },
+    { icon:'sunset', label:'Sunset', value: fmtTime(daily.sunset?.[idx]) },
+    { icon:'wind', label:'Peak Wind', value:`${Math.round(daily.wind_speed_10m_max?.[idx]||0)} ${wUnit}` },
+    { icon:'wind', label:'Peak Gusts', value:`${Math.round(daily.wind_gusts_10m_max?.[idx]||0)} ${wUnit}` },
+    { icon:'sun', label:'Solar Sum', value:`${Math.round(daily.shortwave_radiation_sum?.[idx]||0)} MJ/m²` },
+  ];
+  return `
+  <div class="glass rounded-2xl p-5 mt-4 fade-in">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <i data-lucide="${ic}" class="${icColor}" style="width:28px;height:28px"></i>
+        <div>
+          <p class="font-semibold text-lg">${new Date(t).toLocaleDateString([], {weekday:'long', month:'short', day:'numeric'})} <span class="text-slate-400 font-normal text-sm">· ${escapeHtml(WEATHER_DESC[daily.weather_code[idx]] || '—')}</span></p>
+          <p class="text-sm text-slate-400">${Math.round(daily.temperature_2m_max[idx])}° / ${Math.round(daily.temperature_2m_min[idx])}°</p>
+        </div>
+      </div>
+      <button onclick="toggleDay(${idx})" class="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-white/10 transition-colors">
+        <i data-lucide="x" style="width:18px;height:18px"></i>
+      </button>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+      ${items.map(it => `
+        <div class="bg-white/5 border border-white/5 rounded-xl p-3">
+          <div class="flex items-center gap-1.5 text-slate-400 mb-1"><i data-lucide="${it.icon}" style="width:12px;height:12px"></i><span class="text-xs font-medium">${it.label}</span></div>
+          <p class="text-sm font-semibold text-white">${it.value}</p>
+        </div>`).join('')}
+    </div>
+  </div>`;
+}
+
 function buildMetrics() {
   const { current, daily, hourly } = state.weather;
   const unit = state.unit;
@@ -490,6 +701,7 @@ function buildMetrics() {
   const tMin = unit==='F'?-20:-30, tMax = unit==='F'?120:50;
 
   const metrics = [
+    { icon:'thermometer', label:'Feels Like', value:`${Math.round(current.apparent_temperature)}`, unit:`°${unit}`, sub:`Actual ${Math.round(current.temperature_2m)}°`, raw: current.apparent_temperature, min:tMin, max:tMax, color:'#fb7185' },
     { icon:'wind', label:'Wind', value:`${Math.round(current.wind_speed_10m)}`, unit: wUnit, sub:`${windDir(current.wind_direction_10m)} · Gusts ${Math.round(current.wind_gusts_10m||0)}`, raw: current.wind_speed_10m, min:0, max:wMax, color:'#60a5fa' },
     { icon:'droplets', label:'Humidity', value:`${current.relative_humidity_2m}`, unit:'%', sub:`Dew pt ${Math.round(current.dew_point_2m||0)}°`, raw: current.relative_humidity_2m, min:0, max:100, color:'#22d3ee' },
     { icon:'sun', label:'UV Index', value:`${Math.round(daily.uv_index_max[0]||0)}`, unit:'', sub: uvSeverity(daily.uv_index_max[0]), subClass: uvColor(daily.uv_index_max[0]), raw: daily.uv_index_max[0]||0, min:0, max:12, color:'#fbbf24' },
@@ -498,12 +710,18 @@ function buildMetrics() {
     aqiCur ? { icon:'activity', label:'AQI (EU)', value:`${aqiCur.european_aqi ?? '—'}`, unit:'AQI', sub:'European scale', raw: aqiCur.european_aqi||0, min:0, max:150, color:'#f472b6' } : null,
     { icon:'gauge', label:'Pressure', value:`${Math.round(current.surface_pressure)}`, unit:'hPa', sub:`MSL ${Math.round(current.pressure_msl||0)} hPa`, raw: current.pressure_msl||current.surface_pressure, min:950, max:1050, color:'#fbbf24' },
     { icon:'layers', label:'Cloud Cover', value:`${current.cloud_cover}`, unit:'%', sub:`Low ${current.cloud_cover_low}% · High ${current.cloud_cover_high}%`, raw: current.cloud_cover, min:0, max:100, color:'#cbd5e1' },
+    { icon:'cloud', label:'Mid Cloud', value:`${current.cloud_cover_mid ?? 0}`, unit:'%', sub:'Mid-altitude layer', raw: current.cloud_cover_mid||0, min:0, max:100, color:'#cbd5e1' },
     { icon:'droplet', label:'Precip Total', value:`${(daily.precipitation_sum?.[0]||0).toFixed(2)}`, unit:'in', sub:`Rain ${(daily.rain_sum?.[0]||0).toFixed(2)} in`, raw: daily.precipitation_sum?.[0]||0, min:0, max:4, color:'#38bdf8' },
+    { icon:'cloud-rain', label:'Precip Rate', value:`${(current.precipitation||0).toFixed(2)}`, unit:'in/hr', sub:`Rain ${(current.rain||0).toFixed(2)} · Snow ${(current.snowfall||0).toFixed(2)}`, raw: current.precipitation||0, min:0, max:1, color:'#38bdf8' },
+    { icon:'percent', label:'Precip Chance', value:`${daily.precipitation_probability_max?.[0]||0}`, unit:'%', sub:'Peak chance today', raw: daily.precipitation_probability_max?.[0]||0, min:0, max:100, color:'#38bdf8' },
     { icon:'flame', label:'Soil Temp', value:`${Math.round(current.soil_temperature_0cm)}`, unit:`°${unit}`, sub:`6cm ${Math.round(current.soil_temperature_6cm||0)}° · 18cm ${Math.round(current.soil_temperature_18cm||0)}°`, raw: current.soil_temperature_0cm, min:tMin, max:tMax, color:'#fb923c' },
     { icon:'compass', label:'Soil Moisture', value:`${((current.soil_moisture_0_to_7cm||0)*100).toFixed(0)}`, unit:'%', sub:`7–28cm ${((current.soil_moisture_7_to_28cm||0)*100).toFixed(0)}%`, raw: (current.soil_moisture_0_to_7cm||0)*100, min:0, max:60, color:'#4ade80' },
+    { icon:'compass', label:'Deep Soil Moisture', value:`${((current.soil_moisture_28_to_100cm||0)*100).toFixed(0)}`, unit:'%', sub:'28–100cm depth', raw: (current.soil_moisture_28_to_100cm||0)*100, min:0, max:60, color:'#4ade80' },
+    { icon:'flame', label:'Deep Soil Temp', value:`${Math.round(current.soil_temperature_54cm||0)}`, unit:`°${unit}`, sub:'54cm depth', raw: current.soil_temperature_54cm||0, min:tMin, max:tMax, color:'#fb923c' },
     { icon:'thermometer', label:'Wet Bulb Temp', value:`${Math.round(current.wet_bulb_temperature_2m||0)}`, unit:`°${unit}`, sub:'Thermodynamic limit', raw: current.wet_bulb_temperature_2m||0, min:tMin, max:tMax, color:'#f87171' },
     { icon:'zap', label:'Vapor Deficit', value:`${(hourly.vapor_pressure_deficit?.[hrIdx]||0).toFixed(2)}`, unit:'kPa', sub:'Atmospheric demand', raw: hourly.vapor_pressure_deficit?.[hrIdx]||0, min:0, max:5, color:'#facc15' },
     { icon:'sun', label:'Solar Radiation', value:`${Math.round(hourly.shortwave_radiation?.[hrIdx]||0)}`, unit:'W/m²', sub:`Direct ${Math.round(hourly.direct_radiation?.[hrIdx]||0)}`, raw: hourly.shortwave_radiation?.[hrIdx]||0, min:0, max:1000, color:'#fde047' },
+    { icon:'cloud-sun', label:'Diffuse Radiation', value:`${Math.round(hourly.diffuse_radiation?.[hrIdx]||0)}`, unit:'W/m²', sub:'Scattered sunlight', raw: hourly.diffuse_radiation?.[hrIdx]||0, min:0, max:600, color:'#fde047' },
     { icon:'arrow-up-right', label:'Boundary Layer', value:`${Math.round(hourly.boundary_layer_height?.[hrIdx]||0)}`, unit:'m', sub:'Mixing depth', raw: hourly.boundary_layer_height?.[hrIdx]||0, min:0, max:3000, color:'#93c5fd' },
     { icon:'zap', label:'CAPE', value:`${Math.round(hourly.cape?.[hrIdx]||0)}`, unit:'J/kg', sub:'Convective potential', raw: hourly.cape?.[hrIdx]||0, min:0, max:4000, color:'#f59e0b' },
     { icon:'shield-alert', label:'Lifted Index', value:`${(hourly.lifted_index?.[hrIdx]||0).toFixed(1)}`, unit:'', sub:'Atmospheric stability', raw: hourly.lifted_index?.[hrIdx]||0, min:-10, max:10, color:'#f87171' },
@@ -693,6 +911,140 @@ function thermometerGauge(current, daily) {
   </div>`;
 }
 
+/* ============================== RENDER: SKY ARC + MOON ============================== */
+
+function renderSkyArcPanel(compact) {
+  const { daily } = state.weather;
+  const now = new Date();
+  const sunrise = daily.sunrise[0], sunset = daily.sunset[0];
+  const { frac, isDay, phaseLabel } = sunArcProgress(now, sunrise, sunset);
+
+  // Arc geometry: semicircle from left (rise) to right (set)
+  const w = 320, h = compact ? 100 : 150, cx = w/2, cy = compact ? 82 : 130, r = compact ? 68 : 110;
+  const rad = (180 - frac*180) * Math.PI/180;
+  const bodyX = cx - r * Math.cos(rad);
+  const bodyY = cy - r * Math.sin(rad);
+
+  let arcPath = `M ${cx-r} ${cy} A ${r} ${r} 0 0 1 ${cx+r} ${cy}`;
+  let ticks = '';
+  [0,0.25,0.5,0.75,1].forEach(f => {
+    const a = (180 - f*180) * Math.PI/180;
+    const tx = cx - r*Math.cos(a), ty = cy - r*Math.sin(a);
+    ticks += `<circle cx="${tx}" cy="${ty}" r="2" fill="rgba(255,255,255,0.2)" />`;
+  });
+
+  const bodyColor = isDay ? '#fbbf24' : '#e2e8f0';
+  const bodyGlow = isDay ? 'rgba(251,191,36,0.5)' : 'rgba(226,232,240,0.4)';
+
+  const timeNow = now.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+  const padCls = compact ? 'p-4' : 'p-6';
+  const titleCls = compact ? 'text-base' : 'text-lg';
+  const bodyR = compact ? 5 : 7, bodyGlowR = compact ? 9 : 12;
+
+  return `
+  <div class="glass rounded-3xl ${padCls} shadow-xl relative overflow-hidden">
+    <div class="absolute -top-24 -left-24 w-64 h-64 ${isDay?'bg-amber-500/10':'bg-indigo-500/10'} blur-[80px] rounded-full pointer-events-none"></div>
+    <div class="flex items-center justify-between mb-1 relative z-10">
+      <div class="flex items-center gap-2 text-slate-200">
+        <i data-lucide="${isDay?'sun':'moon-star'}" class="${isDay?'text-amber-400':'text-slate-300'}" style="width:${compact?16:20}px;height:${compact?16:20}px"></i>
+        <h3 class="font-semibold ${titleCls}">Sky Position</h3>
+      </div>
+      <span class="text-xs font-mono px-2.5 py-1 rounded-full bg-white/10 text-slate-300">${phaseLabel} · ${timeNow}</span>
+    </div>
+    <div class="relative z-10">
+      <svg viewBox="0 0 ${w} ${h}" class="w-full h-auto">
+        <line x1="10" y1="${cy}" x2="${w-10}" y2="${cy}" stroke="rgba(255,255,255,0.12)" stroke-width="1.5" stroke-dasharray="3,4" />
+        <path d="${arcPath}" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="2" stroke-dasharray="4,5" />
+        ${ticks}
+        <circle cx="${cx-r}" cy="${cy}" r="3" fill="rgba(255,255,255,0.3)" />
+        <circle cx="${cx+r}" cy="${cy}" r="3" fill="rgba(255,255,255,0.3)" />
+        <text x="${cx-r}" y="${cy+18}" text-anchor="middle" class="instrument-label" font-size="10">${fmtTime(sunrise)}</text>
+        <text x="${cx+r}" y="${cy+18}" text-anchor="middle" class="instrument-label" font-size="10">${fmtTime(sunset)}</text>
+        <circle cx="${bodyX}" cy="${bodyY}" r="${bodyGlowR}" fill="${bodyColor}" opacity="0.25" />
+        <circle cx="${bodyX}" cy="${bodyY}" r="${bodyR}" fill="${bodyColor}" style="filter:drop-shadow(0 0 8px ${bodyGlow})" />
+      </svg>
+    </div>
+    ${compact ? '' : `
+    <div class="grid grid-cols-2 gap-3 mt-3 relative z-10">
+      <div class="bg-white/5 rounded-2xl p-3 border border-white/5 flex items-center gap-3">
+        <i data-lucide="sunrise" class="text-amber-400 shrink-0" style="width:22px;height:22px"></i>
+        <div class="min-w-0">
+          <p class="text-xs text-slate-400">Sunrise</p>
+          <p class="font-semibold text-sm">${fmtTime(sunrise)}</p>
+        </div>
+      </div>
+      <div class="bg-white/5 rounded-2xl p-3 border border-white/5 flex items-center gap-3">
+        <i data-lucide="sunset" class="text-orange-500 shrink-0" style="width:22px;height:22px"></i>
+        <div class="min-w-0">
+          <p class="text-xs text-slate-400">Sunset</p>
+          <p class="font-semibold text-sm">${fmtTime(sunset)}</p>
+        </div>
+      </div>
+    </div>`}
+  </div>`;
+}
+
+function renderMoonPanel(compact) {
+  const now = new Date();
+  const moon = moonPhase(now);
+  const cx=60, cy=60, r=48;
+  // Simple terminator ellipse approach to depict phase
+  const wax = moon.phase < 0.5; // waxing vs waning
+  const rx = Math.abs(1 - 2*moon.phase) * r; // terminator ellipse half-width
+  const lit = wax ? 'right' : 'left';
+
+  const padCls = compact ? 'p-4' : 'p-6';
+  const titleCls = compact ? 'text-base' : 'text-lg';
+  const svgCls = compact ? 'w-14 h-14 mb-2' : 'w-24 h-24 mb-3';
+  const nameCls = compact ? 'text-sm' : 'text-base';
+
+  if (compact) {
+    return `
+    <div class="glass rounded-3xl p-4 shadow-xl flex items-center gap-4">
+      <svg viewBox="0 0 120 120" class="w-14 h-14 shrink-0">
+        <defs>
+          <clipPath id="moonClipC"><circle cx="${cx}" cy="${cy}" r="${r}" /></clipPath>
+        </defs>
+        <circle cx="${cx}" cy="${cy}" r="${r+6}" fill="rgba(226,232,240,0.05)" />
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="#1e293b" stroke="rgba(255,255,255,0.15)" />
+        <g clip-path="url(#moonClipC)">
+          <rect x="${lit==='right' ? cx : cx-r}" y="${cy-r}" width="${r}" height="${r*2}" fill="#e2e8f0" />
+          <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${r}" fill="${wax ? '#e2e8f0' : '#1e293b'}" />
+        </g>
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="rgba(255,255,255,0.15)" />
+      </svg>
+      <div class="min-w-0">
+        <div class="flex items-center gap-1.5 text-slate-400 mb-0.5"><i data-lucide="moon" style="width:13px;height:13px"></i><span class="text-xs font-medium">Moon</span></div>
+        <p class="font-semibold text-sm truncate">${moon.name}</p>
+        <p class="text-xs text-slate-400">${moon.illumination}% illuminated</p>
+      </div>
+    </div>`;
+  }
+
+  return `
+  <div class="glass rounded-3xl ${padCls} shadow-xl flex flex-col items-center text-center">
+    <div class="flex items-center gap-2 mb-4 text-slate-200 self-start">
+      <i data-lucide="moon" class="text-slate-300" style="width:20px;height:20px"></i>
+      <h3 class="font-semibold ${titleCls}">Moon</h3>
+    </div>
+    <svg viewBox="0 0 120 120" class="${svgCls}">
+      <defs>
+        <clipPath id="moonClip"><circle cx="${cx}" cy="${cy}" r="${r}" /></clipPath>
+      </defs>
+      <circle cx="${cx}" cy="${cy}" r="${r+6}" fill="rgba(226,232,240,0.05)" />
+      <circle cx="${cx}" cy="${cy}" r="${r}" fill="#1e293b" stroke="rgba(255,255,255,0.15)" />
+      <g clip-path="url(#moonClip)">
+        <rect x="${lit==='right' ? cx : cx-r}" y="${cy-r}" width="${r}" height="${r*2}" fill="#e2e8f0" />
+        <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${r}" fill="${wax ? '#e2e8f0' : '#1e293b'}" />
+      </g>
+      <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="rgba(255,255,255,0.15)" />
+    </svg>
+    <p class="font-semibold ${nameCls}">${moon.name}</p>
+
+    <p class="text-sm text-slate-400 mt-1">${moon.illumination}% illuminated</p>
+  </div>`;
+}
+
 function renderInstrumentPanel() {
   const { current, daily } = state.weather;
   return `
@@ -703,6 +1055,75 @@ function renderInstrumentPanel() {
       ${barometerGauge(current)}
       ${thermometerGauge(current, daily)}
     </div>
+  </div>`;
+}
+
+/* ============================== RENDER: SMART ALERTS ============================== */
+
+const SMART_LEVEL_STYLE = {
+  warn: { bg:'bg-orange-500/10', text:'text-orange-300', border:'border-orange-500/20', dot:'bg-orange-400' },
+  info: { bg:'bg-blue-500/10', text:'text-blue-300', border:'border-blue-500/20', dot:'bg-blue-400' },
+  good: { bg:'bg-emerald-500/10', text:'text-emerald-300', border:'border-emerald-500/20', dot:'bg-emerald-400' },
+};
+
+function renderSmartAlertsPanel() {
+  const tips = generateSmartAlerts();
+  const officialCount = state.alerts.length;
+  return `
+  <div class="glass rounded-3xl p-6 shadow-xl">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-2 text-slate-200">
+        <i data-lucide="brain-circuit" class="text-blue-400" style="width:20px;height:20px"></i>
+        <h3 class="font-semibold text-lg">Smart Alerts</h3>
+      </div>
+      ${officialCount>0 ? `<button onclick="setView('warnings')" class="text-xs font-mono px-2.5 py-1 rounded-full bg-red-500/15 text-red-300 hover:bg-red-500/25 transition-colors">${officialCount} official</button>` : ''}
+    </div>
+    <div class="space-y-2.5">
+      ${tips.map(t => {
+        const s = SMART_LEVEL_STYLE[t.level] || SMART_LEVEL_STYLE.info;
+        return `
+        <div class="flex items-start gap-3 p-3 rounded-2xl border ${s.border} ${s.bg}">
+          <i data-lucide="${t.icon}" class="${s.text} shrink-0 mt-0.5" style="width:18px;height:18px"></i>
+          <p class="text-sm text-slate-200 leading-relaxed">${escapeHtml(t.text)}</p>
+        </div>`;
+      }).join('')}
+    </div>
+    <p class="text-xs text-slate-500 mt-4 flex items-center gap-1.5"><i data-lucide="info" style="width:12px;height:12px"></i>Generated from current local conditions, not an official forecast.</p>
+  </div>`;
+}
+
+/* ============================== RENDER: NATIONAL STORM TRACKER ============================== */
+
+function renderStormTrackerPanel() {
+  const alerts = state.nationalAlerts;
+  const counts = alerts.reduce((acc, a) => { acc[a.event] = (acc[a.event]||0)+1; return acc; }, {});
+  const legend = Object.keys(STORM_EVENT_STYLE).filter(e => counts[e]);
+  const sorted = [...alerts].sort((a,b) => stormStyle(b.event).priority - stormStyle(a.event).priority);
+
+  return `
+  <div class="glass rounded-3xl p-5 shadow-xl flex flex-col h-[520px]">
+    <div class="flex items-center gap-2 mb-4 text-slate-200">
+      <i data-lucide="tornado" class="text-red-400" style="width:20px;height:20px"></i>
+      <h3 class="font-semibold text-lg">National Storm Tracker</h3>
+    </div>
+    ${legend.length ? `
+    <div class="flex flex-wrap gap-2 mb-4">
+      ${legend.map(e => `<span class="text-xs font-mono px-2.5 py-1 rounded-full flex items-center gap-1.5" style="background:${stormStyle(e).color}22;color:${stormStyle(e).color}">
+        <span class="w-2 h-2 rounded-full" style="background:${stormStyle(e).color}"></span>${e} (${counts[e]})
+      </span>`).join('')}
+    </div>` : ''}
+    <div class="flex-1 overflow-y-auto no-scrollbar space-y-2 pr-1">
+      ${state.nationalAlertsError ? `<p class="text-sm text-red-400">Couldn't reach the National Weather Service alert feed. Try refreshing.</p>` :
+        (!state.nationalAlertsLoading && sorted.length === 0) ? `<p class="text-sm text-emerald-300 flex items-center gap-1.5"><i data-lucide="shield-check" style="width:14px;height:14px"></i>No active tornado or severe storm warnings nationwide right now.</p>` :
+        sorted.map(a => {
+          const s = stormStyle(a.event);
+          return `<button onclick="focusOnAlert('${escapeAttr(a.id||'')}')" class="w-full text-left glass rounded-xl p-3 border-l-4 hover:bg-white/10 transition-colors" style="border-color:${s.color}">
+            <div class="flex items-center gap-1.5 text-xs font-semibold" style="color:${s.color}"><span class="w-2 h-2 rounded-full" style="background:${s.color}"></span>${escapeHtml(a.event)}</div>
+            <p class="text-xs text-slate-400 mt-1 truncate">${escapeHtml(a.areaDesc||'')}</p>
+          </button>`;
+        }).join('')}
+    </div>
+    <p class="text-xs text-slate-500 mt-3 pt-3 border-t border-white/5">${alerts.length} active severe alert${alerts.length!==1?'s':''} across the US · Source: National Weather Service · Shown on the radar map</p>
   </div>`;
 }
 
@@ -719,13 +1140,13 @@ function renderDashboard() {
   const next24 = hourly.time.slice(currentHourIdx, currentHourIdx+25).map((t,i) => {
     const idx = currentHourIdx+i;
     const hr = new Date(t).getHours();
-    return { time: new Date(t).toLocaleTimeString([], {hour:'numeric'}), temp: Math.round(hourly.temperature_2m[idx]), code: hourly.weather_code[idx], precip: hourly.precipitation_probability[idx], isDay: hr>=6 && hr<=19 };
+    return { time: new Date(t).toLocaleTimeString([], {hour:'numeric'}), temp: Math.round(hourly.temperature_2m[idx]), code: hourly.weather_code[idx], precip: hourly.precipitation_probability[idx], isDay: hr>=6 && hr<=19, idx };
   });
 
   const days = daily.time.slice(1,8).map((t,i) => ({
     day: new Date(t).toLocaleDateString([], {weekday:'short'}),
     max: Math.round(daily.temperature_2m_max[i+1]), min: Math.round(daily.temperature_2m_min[i+1]),
-    code: daily.weather_code[i+1], precip: daily.precipitation_probability_max[i+1]
+    code: daily.weather_code[i+1], precip: daily.precipitation_probability_max[i+1], dayIdx: i+1
   }));
 
   const alertBanner = state.alerts.length > 0 ? (() => {
@@ -759,98 +1180,131 @@ function renderDashboard() {
     </div>` : '';
 
   return `
-  <main class="max-w-7xl mx-auto px-4 md:px-8 mt-8 space-y-6">
+  <main class="max-w-7xl mx-auto px-4 md:px-8 mt-8 space-y-8">
     ${alertBanner}
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      <div class="lg:col-span-2 space-y-6">
 
-        <div class="relative bg-gradient-to-br from-blue-600/20 to-indigo-900/40 backdrop-blur-2xl border border-white/10 rounded-3xl p-8 overflow-hidden shadow-2xl">
-          <div class="absolute -top-32 -right-32 w-96 h-96 bg-blue-500/20 blur-[100px] rounded-full pointer-events-none"></div>
-          <div class="flex justify-between items-start relative z-10">
-            <div>
-              <h2 class="text-3xl font-bold tracking-tight text-white flex items-center gap-2">
-                ${escapeHtml(state.location.name.split(',')[0])}
-                <i data-lucide="navigation" class="text-blue-400 rotate-45" style="width:18px;height:18px"></i>
-              </h2>
-              <p class="text-slate-300 mt-1">${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric'})}</p>
-            </div>
+    <!-- SECTION: Current Conditions -->
+    <section class="space-y-6">
+      <div class="relative bg-gradient-to-br from-blue-600/20 to-indigo-900/40 backdrop-blur-2xl border border-white/10 rounded-3xl p-8 overflow-hidden shadow-2xl">
+        <div class="absolute -top-32 -right-32 w-96 h-96 bg-blue-500/20 blur-[100px] rounded-full pointer-events-none"></div>
+        <div class="flex justify-between items-start relative z-10">
+          <div>
+            <h2 class="text-3xl font-bold tracking-tight text-white flex items-center gap-2">
+              ${escapeHtml(state.location.name.split(',')[0])}
+              <i data-lucide="navigation" class="text-blue-400 rotate-45" style="width:18px;height:18px"></i>
+            </h2>
+            <p class="text-slate-300 mt-1">${new Date().toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric'})}</p>
           </div>
-          <div class="mt-8 md:mt-12 flex flex-col md:flex-row md:items-end justify-between gap-6 md:gap-8 relative z-10">
-            <div class="flex items-center gap-3 sm:gap-6">
-              <div class="filter drop-shadow-[0_0_15px_rgba(255,255,255,0.2)] flex-shrink-0"><i data-lucide="${icon}" class="${iconColor} w-16 h-16 sm:w-24 sm:h-24"></i></div>
-              <div class="min-w-0">
-                <div class="flex items-start">
-                  <span class="text-5xl sm:text-7xl md:text-8xl font-bold tracking-tighter">${Math.round(current.temperature_2m)}</span>
-                  <span class="text-xl sm:text-3xl font-medium text-slate-300 mt-1 sm:mt-2">°${unit}</span>
-                </div>
-                <p class="text-base sm:text-xl text-slate-200 mt-1 sm:mt-2 font-medium">${WEATHER_DESC[current.weather_code] || 'Unknown'}</p>
+        </div>
+        <div class="mt-8 md:mt-12 flex flex-col md:flex-row md:items-end justify-between gap-6 md:gap-8 relative z-10">
+          <div class="flex items-center gap-3 sm:gap-6">
+            <div class="filter drop-shadow-[0_0_15px_rgba(255,255,255,0.2)] flex-shrink-0"><i data-lucide="${icon}" class="${iconColor} w-16 h-16 sm:w-24 sm:h-24"></i></div>
+            <div class="min-w-0">
+              <div class="flex items-start">
+                <span class="text-5xl sm:text-7xl md:text-8xl font-bold tracking-tighter">${Math.round(current.temperature_2m)}</span>
+                <span class="text-xl sm:text-3xl font-medium text-slate-300 mt-1 sm:mt-2">°${unit}</span>
               </div>
-            </div>
-            <div class="flex gap-4 sm:gap-6 text-slate-200 bg-white/5 p-3 sm:p-4 rounded-2xl border border-white/5">
-              <div class="flex flex-col items-center"><span class="text-xs sm:text-sm text-slate-400 mb-1">Feels Like</span><span class="text-lg sm:text-xl font-semibold">${Math.round(current.apparent_temperature)}°</span></div>
-              <div class="w-px bg-white/10"></div>
-              <div class="flex flex-col items-center"><span class="text-xs sm:text-sm text-slate-400 mb-1">High / Low</span><span class="text-lg sm:text-xl font-semibold">${maxTemp}° / ${minTemp}°</span></div>
+              <p class="text-base sm:text-xl text-slate-200 mt-1 sm:mt-2 font-medium">${WEATHER_DESC[current.weather_code] || 'Unknown'}</p>
             </div>
           </div>
-        </div>
-
-        ${renderInstrumentPanel()}
-
-        <div class="glass rounded-3xl p-6 shadow-xl">
-          <div class="flex items-center gap-2 mb-6 text-slate-200"><i data-lucide="clock" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">Today's Forecast</h3></div>
-          <div class="flex overflow-x-auto gap-4 pb-4 -mx-2 px-2 no-scrollbar">
-            ${next24.map((h,idx) => {
-              const [ic, ic_color] = ICON_MAP(h.code, h.isDay ? 1 : 0);
-              return `
-              <div class="flex flex-col items-center min-w-[80px] p-4 rounded-2xl transition-colors ${idx===0 ? 'bg-blue-500/20 border border-blue-500/30' : 'bg-white/5 border border-white/5'}">
-                <span class="text-sm font-medium text-slate-300 mb-3">${idx===0?'Now':h.time}</span>
-                <i data-lucide="${ic}" class="${ic_color} mb-3" style="width:26px;height:26px"></i>
-                <span class="text-lg font-bold mb-1">${h.temp}°</span>
-                <div class="flex items-center gap-1 text-xs text-blue-300 font-medium"><i data-lucide="droplets" style="width:10px;height:10px"></i>${h.precip}%</div>
-              </div>`;
-            }).join('')}
+          <div class="flex gap-4 sm:gap-6 text-slate-200 bg-white/5 p-3 sm:p-4 rounded-2xl border border-white/5">
+            <div class="flex flex-col items-center"><span class="text-xs sm:text-sm text-slate-400 mb-1">Feels Like</span><span class="text-lg sm:text-xl font-semibold">${Math.round(current.apparent_temperature)}°</span></div>
+            <div class="w-px bg-white/10"></div>
+            <div class="flex flex-col items-center"><span class="text-xs sm:text-sm text-slate-400 mb-1">High / Low</span><span class="text-lg sm:text-xl font-semibold">${maxTemp}° / ${minTemp}°</span></div>
           </div>
         </div>
+      </div>
 
-        <div class="glass p-5 rounded-3xl shadow-xl flex flex-col h-[400px]">
-          <div class="flex items-center gap-2 mb-4 text-slate-200"><i data-lucide="activity" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">Live Radar Map</h3></div>
+      ${renderInstrumentPanel()}
+
+      <!-- Sky (Sun arc + Moon), shrunk, directly under instruments -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div class="lg:col-span-2">${renderSkyArcPanel(true)}</div>
+        <div>${renderMoonPanel(true)}</div>
+      </div>
+
+      <div class="glass rounded-3xl p-6 shadow-xl">
+        <div class="flex items-center gap-2 mb-6 text-slate-200"><i data-lucide="clock" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">Today's Forecast</h3><span class="text-xs text-slate-500 font-normal ml-1">· tap an hour for details</span></div>
+        <div class="flex overflow-x-auto gap-4 pb-4 -mx-2 px-2 no-scrollbar">
+          ${next24.map((h,idx) => {
+            const [ic, ic_color] = ICON_MAP(h.code, h.isDay ? 1 : 0);
+            const active = state.expandedHour === h.idx;
+            return `
+            <button onclick="toggleHour(${h.idx})" class="flex flex-col items-center min-w-[80px] p-4 rounded-2xl transition-colors text-left ${active ? 'bg-blue-500/30 border border-blue-400/50' : (idx===0 ? 'bg-blue-500/20 border border-blue-500/30' : 'bg-white/5 border border-white/5 hover:bg-white/10')}">
+              <span class="text-sm font-medium text-slate-300 mb-3">${idx===0?'Now':h.time}</span>
+              <i data-lucide="${ic}" class="${ic_color} mb-3" style="width:26px;height:26px"></i>
+              <span class="text-lg font-bold mb-1">${h.temp}°</span>
+              <div class="flex items-center gap-1 text-xs text-blue-300 font-medium"><i data-lucide="droplets" style="width:10px;height:10px"></i>${h.precip}%</div>
+            </button>`;
+          }).join('')}
+        </div>
+        ${state.expandedHour !== null ? renderHourDetail(state.expandedHour) : ''}
+      </div>
+    </section>
+
+    <!-- SECTION: 7-Day Forecast -->
+    <section>
+      <div class="glass rounded-3xl p-6 shadow-xl">
+        <div class="flex items-center gap-2 mb-6 text-slate-200"><i data-lucide="calendar" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">7-Day Forecast</h3><span class="text-xs text-slate-500 font-normal ml-1">· tap a day for details</span></div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-x-6">
+          ${days.map(d => {
+            const [ic, ic_color] = ICON_MAP(d.code, 1);
+            const active = state.expandedDay === d.dayIdx;
+            return `
+            <button onclick="toggleDay(${d.dayIdx})" class="flex lg:flex-col items-center justify-between lg:justify-start lg:text-center gap-2 py-2.5 lg:py-3 border-b border-white/5 lg:border-0 last:border-0 rounded-xl transition-colors text-left w-full ${active ? 'bg-blue-500/20 border border-blue-400/40 lg:border' : 'hover:bg-white/5'}">
+              <span class="text-sm font-medium text-slate-300 w-10 lg:w-auto lg:mb-2">${d.day}</span>
+              <i data-lucide="${ic}" class="${ic_color} lg:mb-2" style="width:20px;height:20px"></i>
+              <span class="text-xs text-blue-300 w-10 lg:w-auto lg:mb-2 text-right lg:text-center">${d.precip}%</span>
+              <div class="flex items-center gap-2 w-20 lg:w-auto justify-end lg:justify-center">
+                <span class="text-sm font-semibold">${d.max}°</span>
+                <span class="text-sm text-slate-500">${d.min}°</span>
+              </div>
+            </button>`;
+          }).join('')}
+        </div>
+        ${state.expandedDay !== null ? renderDayDetail(state.expandedDay) : ''}
+      </div>
+    </section>
+
+
+    <!-- SECTION: Detailed Metrics -->
+    <section>
+      <div class="flex items-center gap-2 mb-4 text-slate-200"><i data-lucide="layout-grid" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">Detailed Metrics</h3></div>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 md:gap-4">
+        ${buildMetrics()}
+      </div>
+    </section>
+
+    <!-- SECTION: Radar & Storm Map -->
+    <section>
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div class="flex items-center gap-2 text-slate-200"><i data-lucide="map" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">Radar & Storm Map</h3></div>
+        <p class="text-xs text-slate-500 flex items-center gap-1.5"><i data-lucide="mouse-pointer-click" style="width:12px;height:12px"></i>Tap anywhere on the map for area details</p>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="glass p-5 rounded-3xl shadow-xl flex flex-col h-[520px] lg:col-span-2">
+          <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <div class="flex items-center gap-2 text-slate-200"><i data-lucide="activity" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">Live Radar</h3></div>
+            <button onclick="fetchNationalStormAlerts()" class="flex items-center gap-1.5 text-xs font-mono px-2.5 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 transition-colors">
+              <i data-lucide="refresh-cw" class="${state.nationalAlertsLoading?'animate-spin':''}" style="width:12px;height:12px"></i> Refresh Alerts
+            </button>
+          </div>
           <div id="radar-map" class="w-full flex-1 rounded-2xl overflow-hidden border border-white/5 z-0"></div>
+          <div id="area-detail-panel" class="mt-3 text-xs font-mono text-slate-400 min-h-[18px]">Precipitation radar + active NWS severe warnings (tornado, hurricane, flash flood) shown together. Click the map to inspect an area.</div>
         </div>
-
-        ${forecastNarrative}
+        ${renderStormTrackerPanel()}
       </div>
+    </section>
 
-      <div class="space-y-6">
-        <div class="glass rounded-3xl p-6 shadow-xl">
-          <div class="flex items-center gap-2 mb-6 text-slate-200"><i data-lucide="calendar" class="text-blue-400" style="width:20px;height:20px"></i><h3 class="font-semibold text-lg">7-Day Forecast</h3></div>
-          <div class="space-y-1">
-            ${days.map(d => {
-              const [ic, ic_color] = ICON_MAP(d.code, 1);
-              return `
-              <div class="flex items-center justify-between py-2.5 border-b border-white/5 last:border-0">
-                <span class="text-sm font-medium text-slate-300 w-10">${d.day}</span>
-                <i data-lucide="${ic}" class="${ic_color}" style="width:20px;height:20px"></i>
-                <span class="text-xs text-blue-300 w-10 text-right">${d.precip}%</span>
-                <div class="flex items-center gap-2 w-20 justify-end">
-                  <span class="text-sm font-semibold">${d.max}°</span>
-                  <span class="text-sm text-slate-500">${d.min}°</span>
-                </div>
-              </div>`;
-            }).join('')}
-          </div>
-        </div>
+    <!-- SECTION: Alerts & Safety -->
+    <section>
+      ${renderSmartAlertsPanel()}
+    </section>
 
-        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 gap-3 md:gap-4">
-          ${buildMetrics()}
-        </div>
-
-        <div class="glass rounded-3xl p-6 shadow-xl flex items-center justify-around">
-          <div class="flex flex-col items-center"><i data-lucide="sunrise" class="text-amber-400 mb-2" style="width:28px;height:28px"></i><span class="text-sm text-slate-400">Sunrise</span><span class="font-semibold">${fmtTime(daily.sunrise[0])}</span></div>
-          <div class="w-px h-12 bg-white/10"></div>
-          <div class="flex flex-col items-center"><i data-lucide="sunset" class="text-orange-500 mb-2" style="width:28px;height:28px"></i><span class="text-sm text-slate-400">Sunset</span><span class="font-semibold">${fmtTime(daily.sunset[0])}</span></div>
-        </div>
-      </div>
-    </div>
+    <!-- SECTION: NWS Forecast Discussion -->
+    <section>
+      ${forecastNarrative}
+    </section>
   </main>`;
 }
 
@@ -881,43 +1335,165 @@ function render() {
   if (window.lucide) lucide.createIcons();
 
   if (state.view === 'dashboard') {
-    initRadarMap();
+    initCombinedRadarMap();
+    renderAlertPolygons();
   }
 }
 
-/* ============================== RADAR MAP ============================== */
+/* ============================== COMBINED RADAR + STORM MAP ============================== */
 
-function initRadarMap() {
+function initCombinedRadarMap() {
   const el = document.getElementById('radar-map');
   if (!el || !window.L) return;
   const { lat, lon } = state.location;
 
-  if (leafletMap) { leafletMap.remove(); leafletMap = null; }
+  // Reuse an existing map instance across re-renders so layer toggles / zoom persist.
+  if (leafletMap && leafletMap._container !== el) { leafletMap.remove(); leafletMap = null; }
+  if (leafletMap) { alertLayerGroup && alertLayerGroup.clearLayers(); renderAlertPolygons(); return; }
 
-  leafletMap = L.map(el, { zoomControl:false }).setView([lat, lon], 8);
+  leafletMap = L.map(el, { zoomControl:false }).setView([lat, lon], 7);
   L.control.zoom({ position:'bottomright' }).addTo(leafletMap);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+
+  const base = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     attribution: '&copy; OpenStreetMap &copy; CARTO', subdomains:'abcd', maxZoom:20
   }).addTo(leafletMap);
 
+  precipLayerGroup = L.layerGroup().addTo(leafletMap);
   fetch('https://api.rainviewer.com/public/weather-maps.json')
     .then(r => r.json())
     .then(data => {
       const past = data.radar && data.radar.past;
       if (past && past.length) {
         const latest = past[past.length-1].path;
-        L.tileLayer(`https://tilecache.rainviewer.com${latest}/256/{z}/{x}/{y}/2/1_1.png`, { opacity:0.7, zIndex:10 }).addTo(leafletMap);
+        L.tileLayer(`https://tilecache.rainviewer.com${latest}/256/{z}/{x}/{y}/2/1_1.png`, { opacity:0.65, zIndex:10 }).addTo(precipLayerGroup);
       }
     }).catch(()=>{});
 
+  alertLayerGroup = L.layerGroup().addTo(leafletMap);
+  renderAlertPolygons();
+
   const markerHtml = `<div style="background-color:#3b82f6;width:16px;height:16px;border-radius:50%;border:3px solid white;box-shadow:0 0 10px rgba(59,130,246,0.8);"></div>`;
   const icon = L.divIcon({ className:'custom-div-icon', html: markerHtml, iconSize:[16,16], iconAnchor:[8,8] });
-  L.marker([lat, lon], { icon }).addTo(leafletMap);
+  L.marker([lat, lon], { icon }).addTo(leafletMap).bindPopup(`<b>${escapeHtml(state.location.name)}</b><br>Your location`);
+
+  L.control.layers(null, {
+    'Precipitation Radar': precipLayerGroup,
+    'Severe Storm Warnings': alertLayerGroup,
+  }, { position:'topright', collapsed:true }).addTo(leafletMap);
+
+  leafletMap.on('click', onRadarMapClick);
+}
+
+function renderAlertPolygons() {
+  if (!alertLayerGroup) return;
+  alertLayerGroup.clearLayers();
+  (state.nationalAlerts || []).forEach(a => {
+    const style = stormStyle(a.event);
+    try {
+      if (a.geometry) {
+        const layer = L.geoJSON(a.geometry, {
+          style: { color: style.color, weight:2, fillColor: style.color, fillOpacity:0.22 }
+        }).addTo(alertLayerGroup);
+        layer.bindPopup(`<b>${escapeHtml(a.event)}</b><br>${escapeHtml(a.areaDesc||'')}`);
+      }
+    } catch (e) { /* skip malformed geometry */ }
+  });
+}
+
+/* ============================== AREA DETECTION ============================== */
+
+// Ray-casting point-in-polygon test. point: [lon, lat]. ring: array of [lon, lat].
+function pointInRing(point, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    const intersects = ((yi > point[1]) !== (yj > point[1])) &&
+      (point[0] < (xj - xi) * (point[1] - yi) / ((yj - yi) || 1e-12) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function pointInGeometry(point, geometry) {
+  if (!geometry) return false;
+  if (geometry.type === 'Polygon') {
+    const coords = geometry.coordinates;
+    if (!coords.length || !pointInRing(point, coords[0])) return false;
+    for (let i = 1; i < coords.length; i++) { if (pointInRing(point, coords[i])) return false; }
+    return true;
+  }
+  if (geometry.type === 'MultiPolygon') {
+    return geometry.coordinates.some(poly => pointInGeometry(point, { type:'Polygon', coordinates: poly }));
+  }
+  return false;
+}
+
+function findAlertsAtPoint(lat, lon) {
+  return (state.nationalAlerts || []).filter(a => pointInGeometry([lon, lat], a.geometry));
+}
+
+function onRadarMapClick(e) {
+  const { lat, lng } = e.latlng;
+  const panel = document.getElementById('area-detail-panel');
+  const popup = L.popup({ maxWidth: 260 })
+    .setLatLng(e.latlng)
+    .setContent('<div class="text-xs font-mono text-slate-300">Loading area details…</div>')
+    .openOn(leafletMap);
+  if (panel) panel.innerHTML = `<span class="text-slate-500">Looking up ${lat.toFixed(2)}, ${lng.toFixed(2)}…</span>`;
+
+  const tempUnit = state.unit === 'F' ? 'fahrenheit' : 'celsius';
+  const windUnit = state.unit === 'F' ? 'mph' : 'kmh';
+
+  Promise.all([
+    fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,weather_code,wind_speed_10m&temperature_unit=${tempUnit}&wind_speed_unit=${windUnit}&timezone=auto`).then(r => r.ok ? r.json() : null).catch(() => null),
+    fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=10`, { headers: { 'Accept':'application/json' } }).then(r => r.ok ? r.json() : null).catch(() => null),
+  ]).then(([wx, geo]) => {
+    const hits = findAlertsAtPoint(lat, lng);
+    const addr = geo && geo.address ? geo.address : null;
+    const placeName = addr ? [addr.city || addr.town || addr.village || addr.county, addr.state || addr.country].filter(Boolean).join(', ') : `${lat.toFixed(2)}, ${lng.toFixed(2)}`;
+    const cur = wx && wx.current;
+    const condition = cur ? (WEATHER_DESC[cur.weather_code] || 'Unknown') : null;
+    const tempStr = cur ? `${Math.round(cur.temperature_2m)}°${state.unit}` : null;
+
+    const alertsHtml = hits.length
+      ? hits.map(a => {
+          const s = stormStyle(a.event);
+          return `<div class="mt-1 flex items-center gap-1.5"><span class="w-2 h-2 rounded-full shrink-0" style="background:${s.color}"></span><span class="font-semibold" style="color:${s.color}">${escapeHtml(a.event)}</span></div>`;
+        }).join('')
+      : `<div class="mt-1.5 flex items-center gap-1.5 text-emerald-300"><i data-lucide="shield-check" style="width:12px;height:12px"></i>No active severe warnings here</div>`;
+
+    const content = `
+      <div class="text-xs font-mono min-w-[190px]">
+        <div class="font-semibold text-white mb-1 truncate">${escapeHtml(placeName)}</div>
+        ${cur ? `<div class="text-slate-300">${escapeHtml(condition)} · ${tempStr} · ${Math.round(cur.wind_speed_10m)} ${windUnit==='mph'?'mph':'km/h'} wind</div>` : `<div class="text-slate-500">Conditions unavailable</div>`}
+        ${alertsHtml}
+      </div>`;
+
+    popup.setContent(content);
+    if (panel) {
+      panel.innerHTML = hits.length
+        ? `<span class="font-semibold" style="color:${stormStyle(hits[0].event).color}">${escapeHtml(placeName)}: ${hits.map(h=>escapeHtml(h.event)).join(', ')}</span>`
+        : `<span class="text-slate-400">${escapeHtml(placeName)}${cur ? ` — ${escapeHtml(condition)}, ${tempStr}` : ''} · No active severe warnings</span>`;
+    }
+    if (window.lucide) lucide.createIcons();
+  }).catch(() => {
+    popup.setContent('<div class="text-xs font-mono text-red-400">Couldn\'t load area details.</div>');
+  });
+}
+
+function focusOnAlert(id) {
+  const a = (state.nationalAlerts || []).find(x => String(x.id) === String(id));
+  if (!a || !a.geometry || !leafletMap) return;
+  try {
+    const layer = L.geoJSON(a.geometry);
+    leafletMap.fitBounds(layer.getBounds(), { maxZoom: 8, padding: [20,20] });
+  } catch (e) { /* ignore */ }
 }
 
 /* ============================== INIT ============================== */
 
 fetchAllData();
+fetchNationalStormAlerts();
 </script>
 </body>
 </html>
